@@ -1,0 +1,206 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Hyperparameters
+BATCH_SIZE = 128
+LEARNING_RATE = 0.001
+EPOCHS = 10
+EARLY_STOPPING_PATIENCE = 3
+EMBEDDING_DIM = 128
+IMAGE_SIZE = 32
+CHANNELS = 3
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Paths for saving plots
+IMAGE_GRID_INITIAL_PLOT = "image_grid_initial.png"
+IMAGE_GRID_EMBEDDINGS_PLOT = "image_grid_embeddings.png"
+
+# Load CIFAR-10 dataset
+transform = transforms.Compose([transforms.ToTensor()])
+train_dataset = datasets.CIFAR10(root='./data', train=True, transform=transform, download=True)
+test_dataset = datasets.CIFAR10(root='./data', train=False, transform=transform, download=True)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# Add noise to images
+def add_noise(images, noise_factor=0.3):
+    noise = torch.randn_like(images) * noise_factor
+    noisy_images = images + noise
+    noisy_images = torch.clamp(noisy_images, 0., 1.)
+    return noisy_images
+
+# Encoder
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+        self.conv1 = nn.Conv2d(CHANNELS, 32, kernel_size=4, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)
+        self.fc = nn.Linear(128 * 4 * 4, EMBEDDING_DIM)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+# Decoder
+class Decoder(nn.Module):
+    def __init__(self):
+        super(Decoder, self).__init__()
+        self.fc = nn.Linear(EMBEDDING_DIM, 128 * 4 * 4)
+        self.conv3 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
+        self.conv2 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1)
+        self.conv1 = nn.ConvTranspose2d(32, CHANNELS, kernel_size=4, stride=2, padding=1)
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = x.view(x.size(0), 128, 4, 4)
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv2(x))
+        x = torch.sigmoid(self.conv1(x))
+        return x
+
+# Define model, loss function, and optimizer
+encoder = Encoder().to(DEVICE)
+decoder = Decoder().to(DEVICE)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=LEARNING_RATE)
+
+# Training function
+def train_model(encoder, decoder, train_loader, test_loader, criterion, optimizer, epochs, patience):
+    train_losses, test_losses = [], []
+    best_test_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        encoder.train()
+        decoder.train()
+        train_loss = 0
+        for images, _ in train_loader:
+            images = images.to(DEVICE)
+            noisy_images = add_noise(images)
+            optimizer.zero_grad()
+            encoded_images = encoder(noisy_images)
+            decoded_images = decoder(encoded_images)
+            loss = criterion(decoded_images, images)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * images.size(0)
+        train_loss /= len(train_loader.dataset)
+        train_losses.append(train_loss)
+
+        encoder.eval()
+        decoder.eval()
+        test_loss = 0
+        with torch.no_grad():
+            for images, _ in test_loader:
+                images = images.to(DEVICE)
+                noisy_images = add_noise(images)
+                encoded_images = encoder(noisy_images)
+                decoded_images = decoder(encoded_images)
+                loss = criterion(decoded_images, images)
+                test_loss += loss.item() * images.size(0)
+        test_loss /= len(test_loader.dataset)
+        test_losses.append(test_loss)
+
+        print(f'Epoch [{epoch + 1}/{epochs}], Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}')
+
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping")
+                break
+
+    return train_losses, test_losses
+
+# Function to extract random images and embeddings
+def extract_random_images(data_loader, num_images):
+    all_images, all_true_images, all_labels = [], [], []
+    for images, labels in data_loader:
+        noisy_images = add_noise(images)
+        all_images.append(noisy_images)
+        all_true_images.append(images)
+        all_labels.append(labels)
+    all_images = torch.cat(all_images)[:num_images]
+    all_true_images = torch.cat(all_true_images)[:num_images]
+    all_labels = torch.cat(all_labels)[:num_images]
+    return all_images, all_true_images, all_labels
+
+# Function to display random images
+def display_random_images(data_loader, encoder, decoder, num_images=10):
+    images, true_images, labels = extract_random_images(data_loader, num_images)
+    encoded_images = encoder(images.to(DEVICE))
+    decoded_images = decoder(encoded_images).cpu().detach()
+    fig, axes = plt.subplots(num_images, 3, figsize=(15, num_images * 5))
+    for i in range(num_images):
+        axes[i, 0].imshow(images[i].permute(1, 2, 0))
+        axes[i, 0].set_title(f'Noisy Image {i + 1}')
+        axes[i, 1].imshow(true_images[i].permute(1, 2, 0))
+        axes[i, 1].set_title(f'True Image {i + 1}')
+        axes[i, 2].imshow(decoded_images[i].permute(1, 2, 0))
+        axes[i, 2].set_title(f'Reconstructed Image {i + 1}')
+    plt.tight_layout()
+    plt.show()
+
+# Function to plot image grid on embeddings
+def plot_image_grid_on_embeddings(test_loader, encoder, decoder, grid_size=20, figsize=15, show=False):
+    images, labels, embeddings = get_random_test_images_embeddings(test_loader, encoder)
+    plt.figure(figsize=(figsize, figsize))
+    grid_x = np.linspace(-10, 10, grid_size)
+    grid_y = np.linspace(-10, 10, grid_size)
+    for i, yi in enumerate(grid_x):
+        for j, xi in enumerate(grid_y):
+            ax = plt.subplot(grid_size, grid_size, i * grid_size + j + 1)
+            z_sample = np.array([[xi, yi]])
+            z_sample = torch.from_numpy(z_sample).float().to(DEVICE)
+            z_sample = z_sample.repeat(1, EMBEDDING_DIM // 2)
+            x_decoded = decoder(z_sample).cpu().detach().numpy()
+            x_decoded = x_decoded.reshape(CHANNELS, IMAGE_SIZE, IMAGE_SIZE)
+            ax.imshow(x_decoded.transpose(1, 2, 0))
+            ax.axis("off")
+    if show:
+        plt.show()
+    else:
+        plt.savefig(IMAGE_GRID_EMBEDDINGS_PLOT, bbox_inches="tight")
+        plt.close()
+
+# Extract random test images and embeddings
+def get_random_test_images_embeddings(test_loader, encoder, num_images=10):
+    encoder.eval()
+    images, true_images, labels = extract_random_images(test_loader, num_images)
+    with torch.no_grad():
+        embeddings = encoder(images.to(DEVICE))
+    return images.cpu(), true_images.cpu(), embeddings.cpu()
+
+# Display random images before training
+display_random_images(test_loader, encoder, decoder)
+
+# Train the model
+train_losses, test_losses = train_model(encoder, decoder, train_loader, test_loader, criterion, optimizer, EPOCHS, EARLY_STOPPING_PATIENCE)
+
+# Plot image grid on embeddings after training
+plot_image_grid_on_embeddings(test_loader, encoder, decoder)
+
+# Plot training and test loss
+plt.figure()
+plt.plot(train_losses, label='Train Loss')
+plt.plot(test_losses, label='Test Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+
+# Display random images after training
+display_random_images(test_loader, encoder, decoder)
