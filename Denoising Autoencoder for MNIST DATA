@@ -1,0 +1,200 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+from sklearn.manifold import TSNE
+
+# Set seed for reproducibility
+seed = 42
+torch.manual_seed(seed)
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+# Hyperparameters
+batch_size = 512
+epochs = 20
+learning_rate = 1e-3
+transform = torchvision.transforms.Compose([torchvision.transforms.ToTensor()])
+
+# Load training dataset
+train_dataset = torchvision.datasets.MNIST(
+    root="./data", train=True, transform=transform, download=True
+)
+
+train_loader = torch.utils.data.DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=True
+)
+
+# Load validation dataset
+val_dataset = torchvision.datasets.MNIST(
+    root="./data", train=False, transform=transform, download=True
+)
+
+val_loader = torch.utils.data.DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=False
+)
+
+# Define the Autoencoder class with more layers
+class AE(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_features=kwargs["input_shape"], out_features=512),
+            nn.ReLU(True),
+            nn.Linear(in_features=512, out_features=256),
+            nn.ReLU(True),
+            nn.Linear(in_features=256, out_features=128),
+            nn.ReLU(True),
+            nn.Linear(in_features=128, out_features=64),
+            nn.ReLU(True),
+            nn.Linear(in_features=64, out_features=2)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(in_features=2, out_features=64),
+            nn.ReLU(True),
+            nn.Linear(in_features=64, out_features=128),
+            nn.ReLU(True),
+            nn.Linear(in_features=128, out_features=256),
+            nn.ReLU(True),
+            nn.Linear(in_features=256, out_features=512),
+            nn.ReLU(True),
+            nn.Linear(in_features=512, out_features=kwargs["input_shape"]),
+            nn.Sigmoid()
+        )
+
+    def forward(self, features):
+        code = self.encoder(features)
+        reconstructed = self.decoder(code)
+        return reconstructed, code
+
+# Add Gaussian noise to the images
+def add_noise(images, noise_factor=0.5):
+    noisy = images + noise_factor * torch.randn(*images.shape)
+    noisy = torch.clip(noisy, 0., 1.)
+    return noisy
+
+# Use GPU if available
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Create a model from `AE` autoencoder class
+model = AE(input_shape=784).to(device)
+
+# Create an optimizer object
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Mean-squared error loss
+criterion = nn.MSELoss()
+
+# Training and validation
+train_losses = []
+val_losses = []
+
+for epoch in range(epochs):
+    train_loss = 0
+    val_loss = 0
+
+    # Training loop
+    model.train()
+    for batch_features, _ in train_loader:
+        noisy_batch = add_noise(batch_features)
+        batch_features = batch_features.view(-1, 784).to(device)
+        noisy_batch = noisy_batch.view(-1, 784).to(device)
+
+        optimizer.zero_grad()
+        outputs, _ = model(noisy_batch)
+        loss = criterion(outputs, batch_features)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+
+    # Validation loop
+    model.eval()
+    with torch.no_grad():
+        for batch_features, _ in val_loader:
+            noisy_batch = add_noise(batch_features)
+            batch_features = batch_features.view(-1, 784).to(device)
+            noisy_batch = noisy_batch.view(-1, 784).to(device)
+            outputs, _ = model(noisy_batch)
+            loss = criterion(outputs, batch_features)
+            val_loss += loss.item()
+
+    # Compute average losses
+    train_loss /= len(train_loader)
+    val_loss /= len(val_loader)
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+
+    print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+
+# Plot training and validation loss
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses, label='Training Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Training and Validation Loss')
+plt.show()
+
+# Visualize the latent space
+test_loader = torch.utils.data.DataLoader(
+    val_dataset, batch_size=10000, shuffle=False
+)
+
+with torch.no_grad():
+    for batch_features, labels in test_loader:
+        noisy_batch = add_noise(batch_features)
+        noisy_batch = noisy_batch.view(-1, 784).to(device)
+        _, codes = model(noisy_batch)
+        codes = codes.cpu().numpy()
+        labels = labels.numpy()
+        break
+
+tsne = TSNE(n_components=2, random_state=0)
+tsne_results = tsne.fit_transform(codes)
+
+plt.figure(figsize=(10, 6))
+scatter = plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=labels, cmap='tab10')
+plt.legend(handles=scatter.legend_elements()[0], labels=range(10))
+plt.title("t-SNE visualization of latent space")
+plt.xlabel("Component 1")
+plt.ylabel("Component 2")
+plt.colorbar()
+plt.show()
+
+# Visualize the original, noisy, and reconstructed images
+with torch.no_grad():
+    for batch_features in val_loader:
+        batch_features = batch_features[0].to(device)
+        noisy_batch = add_noise(batch_features)
+        test_examples = noisy_batch.view(-1, 784)
+        reconstruction, _ = model(test_examples)
+        break
+
+reconstruction = reconstruction.cpu()
+noisy_batch = noisy_batch.cpu()
+test_examples = batch_features.cpu()
+
+number = 10
+plt.figure(figsize=(20, 6))
+for index in range(number):
+    # display original
+    ax = plt.subplot(3, number, index + 1)
+    plt.imshow(test_examples[index].numpy().reshape(28, 28), cmap="gray")
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+
+    # display noisy image
+    ax = plt.subplot(3, number, index + 1 + number)
+    plt.imshow(noisy_batch[index].numpy().reshape(28, 28), cmap="gray")
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+
+    # display reconstruction
+    ax = plt.subplot(3, number, index + 1 + 2 * number)
+    plt.imshow(reconstruction[index].numpy().reshape(28, 28), cmap="gray")
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+plt.show()
